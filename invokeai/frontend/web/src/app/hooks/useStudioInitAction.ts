@@ -1,3 +1,4 @@
+import { logger } from 'app/logging/logger';
 import { useAppStore } from 'app/store/storeHooks';
 import { useAssertSingleton } from 'common/hooks/useAssertSingleton';
 import { withResultAsync } from 'common/util/result';
@@ -8,6 +9,7 @@ import type { CanvasRasterLayerState } from 'features/controlLayers/store/types'
 import { imageDTOToImageObject } from 'features/controlLayers/store/util';
 import { $imageViewer } from 'features/gallery/components/ImageViewer/useImageViewer';
 import { sentImageToCanvas } from 'features/gallery/store/actions';
+import { boardIdSelected } from 'features/gallery/store/gallerySlice';
 import { parseAndRecallAllMetadata } from 'features/metadata/util/handlers';
 import { $isWorkflowListMenuIsOpen } from 'features/nodes/store/workflowListMenu';
 import { $isStylePresetsMenuOpen, activeStylePresetIdChanged } from 'features/stylePresets/store/stylePresetSlice';
@@ -16,26 +18,119 @@ import { activeTabCanvasRightPanelChanged, setActiveTab } from 'features/ui/stor
 import { useGetAndLoadLibraryWorkflow } from 'features/workflowLibrary/hooks/useGetAndLoadLibraryWorkflow';
 import { useCallback, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
+import { serializeError } from 'serialize-error';
 import { getImageDTO, getImageMetadata } from 'services/api/endpoints/images';
 import { getStylePreset } from 'services/api/endpoints/stylePresets';
+import { z } from 'zod';
 
-type _StudioInitAction<T extends string, U> = { type: T; data: U };
+const zLoadWorkflowAction = z.object({
+  type: z.literal('loadWorkflow'),
+  data: z.object({ workflowId: z.string() }),
+});
+// type LoadWorkflowAction = z.infer<typeof zLoadWorkflowAction>;
 
-type LoadWorkflowAction = _StudioInitAction<'loadWorkflow', { workflowId: string }>;
-type SelectStylePresetAction = _StudioInitAction<'selectStylePreset', { stylePresetId: string }>;
-type SendToCanvasAction = _StudioInitAction<'sendToCanvas', { imageName: string }>;
-type UseAllParametersAction = _StudioInitAction<'useAllParameters', { imageName: string }>;
-type StudioDestinationAction = _StudioInitAction<
-  'goToDestination',
-  { destination: 'generation' | 'canvas' | 'workflows' | 'upscaling' | 'viewAllWorkflows' | 'viewAllStylePresets' }
->;
+const zSelectBoardAction = z.object({
+  type: z.literal('selectBoard'),
+  data: z.object({ boardId: z.string() }),
+});
+// type SelectBoardAction = z.infer<typeof zSelectBoardAction>;
 
-export type StudioInitAction =
-  | LoadWorkflowAction
-  | SelectStylePresetAction
-  | SendToCanvasAction
-  | UseAllParametersAction
-  | StudioDestinationAction;
+const zSelectImageAction = z.object({
+  type: z.literal('selectImage'),
+  data: z.object({ imageName: z.string() }),
+});
+// type SelectImageAction = z.infer<typeof zSelectImageAction>;
+
+const zSelectStylePresetAction = z.object({
+  type: z.literal('selectStylePreset'),
+  data: z.object({ stylePresetId: z.string() }),
+});
+// type SelectStylePresetAction = z.infer<typeof zSelectStylePresetAction>;
+
+const zSendToCanvasAction = z.object({
+  type: z.literal('sendToCanvas'),
+  data: z.object({ imageName: z.string() }),
+});
+// type SendToCanvasAction = z.infer<typeof zSendToCanvasAction>;
+
+const zUseAllParametersAction = z.object({
+  type: z.literal('useAllParameters'),
+  data: z.object({ imageName: z.string() }),
+});
+// type UseAllParametersAction = z.infer<typeof zUseAllParametersAction>;
+
+const zStudioDestinationAction = z.object({
+  type: z.literal('goToDestination'),
+  data: z.object({
+    destination: z.enum(['generation', 'canvas', 'workflows', 'upscaling', 'viewAllWorkflows', 'viewAllStylePresets']),
+  }),
+});
+type StudioDestinationAction = z.infer<typeof zStudioDestinationAction>;
+
+export const zStudioInitAction = z.discriminatedUnion('type', [
+  zLoadWorkflowAction,
+  zSelectBoardAction,
+  zSelectImageAction,
+  zSelectStylePresetAction,
+  zSendToCanvasAction,
+  zUseAllParametersAction,
+  zStudioDestinationAction,
+]);
+
+export type StudioInitAction = z.infer<typeof zStudioInitAction>;
+
+/**
+ * Converts a given hashbang string to a valid StudioInitAction
+ * @see fillStudioInitAction
+ * @param {string} hashBang
+ * @returns {StudioInitAction}
+ * @throws {z.ZodError | Error} If there is a validation error.
+ */
+export const genHashBangStudioInitAction = (hashBang: string): StudioInitAction => {
+  if (!hashBang.startsWith('#!')) {
+    throw new Error("The given string isn't a valid hashbang action");
+  }
+  const parts = hashBang.substring(2).split('&');
+  return zStudioInitAction.parse({
+    type: parts.shift(),
+    data: Object.fromEntries(new URLSearchParams(parts.join('&'))),
+  });
+};
+
+/**
+ * Uses the HashBang fragment to populate an unset StudioInitAction in case the user tries to execute a StudioInitAction on startup via a location.hash fragment
+ * If any studioInitAction is given, it will early bail with it.
+ * this will interpret and validate the hashbang as an studioInitAction
+ * @returns {StudioInitAction | undefined} undefined if nothing can be resolved
+ */
+export const fillStudioInitAction = (
+  studioInitAction?: StudioInitAction,
+  clearHashBang: boolean = false
+): StudioInitAction | undefined => {
+  if (studioInitAction !== undefined) {
+    return studioInitAction;
+  }
+  if (!location.hash.startsWith('#!')) {
+    return undefined;
+  }
+
+  try {
+    studioInitAction = genHashBangStudioInitAction(location.hash);
+    if (clearHashBang) {
+      location.hash = '';  //reset the hash to "acknowledge" the initAction (and push the history forward)
+    }
+  } catch (err) {
+    const log = logger('system');
+    if (err instanceof z.ZodError) {
+      log.error({ error: serializeError(err) }, 'Problem persisting the studioInitAction from the given hashbang');
+    } else if (err instanceof Error) {
+      log.error({ error: serializeError(err) }, 'Problem interpreting the hashbang');
+    } else {
+      log.error({ error: serializeError(err) }, 'Problem while filling StudioInitAction');
+    }
+  }
+  return studioInitAction;
+};
 
 /**
  * A hook that performs an action when the studio is initialized. This is useful for deep linking into the studio.
@@ -44,7 +139,7 @@ export type StudioInitAction =
  *
  * In this hook, we prefer to use imperative APIs over hooks to avoid re-rendering the parent component. For example:
  * - Use `getImageDTO` helper instead of `useGetImageDTO`
- * - Usee the `$imageViewer` atom instead of `useImageViewer`
+ * - Use the `$imageViewer` atom instead of `useImageViewer`
  */
 export const useStudioInitAction = (action?: StudioInitAction) => {
   useAssertSingleton('useStudioInitAction');
@@ -112,6 +207,15 @@ export const useStudioInitAction = (action?: StudioInitAction) => {
       store.dispatch(setActiveTab('workflows'));
     },
     [getAndLoadWorkflow, store]
+  );
+
+  const handleSelectBoard = useCallback(
+    (boardId: string) => {
+      //TODO: validate given boardID
+      store.dispatch(boardIdSelected({ boardId: boardId }));
+      //TODO: scroll into view
+    },
+    [store]
   );
 
   const handleSelectStylePreset = useCallback(
@@ -184,6 +288,9 @@ export const useStudioInitAction = (action?: StudioInitAction) => {
       case 'loadWorkflow':
         handleLoadWorkflow(action.data.workflowId);
         break;
+      case 'selectBoard':
+        handleSelectBoard(action.data.boardId);
+        break;
       case 'selectStylePreset':
         handleSelectStylePreset(action.data.stylePresetId);
         break;
@@ -202,6 +309,7 @@ export const useStudioInitAction = (action?: StudioInitAction) => {
     handleUseAllMetadata,
     action,
     handleLoadWorkflow,
+    handleSelectBoard,
     handleSelectStylePreset,
     handleGoToDestination,
   ]);
